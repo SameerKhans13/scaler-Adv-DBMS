@@ -39,14 +39,29 @@ export class PageManager {
   }
 
   static deleteTuple(page: Page, slotId: number) {
-    if (page.slots[slotId]) {
-      page.slots[slotId].active = false;
+    while (page.slots.length <= slotId) {
+      page.slots.push({ offset: page.header.freeSpaceOffset, size: 0, active: false });
     }
+    page.slots[slotId].active = false;
   }
 
   static updateTuple(page: Page, slotId: number, updated: Tuple) {
-    if (page.slots[slotId]) {
-      page.data[slotId] = JSON.stringify(updated);
+    const serialized = JSON.stringify(updated);
+    const size = serialized.length;
+    
+    while (page.slots.length <= slotId) {
+      page.slots.push({ offset: page.header.freeSpaceOffset, size: 0, active: false });
     }
+    
+    const existingOffset = page.slots[slotId].offset;
+    page.slots[slotId] = {
+      offset: existingOffset !== undefined ? existingOffset : page.header.freeSpaceOffset,
+      size,
+      active: true
+    };
+    
+    page.data[slotId] = serialized;
+    page.header.freeSpaceOffset = Math.max(page.header.freeSpaceOffset, page.slots[slotId].offset + size);
+    page.header.slotCount = Math.max(page.header.slotCount, slotId + 1);
   }
 }

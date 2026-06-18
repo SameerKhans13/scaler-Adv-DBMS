@@ -67,7 +67,7 @@ export class BufferPoolManager {
 
   flushAll() {
     for (const frame of this.frames) {
-      if (frame.pageId !== null && frame.isDirty) {
+      if (frame.pageId !== null && frame.isDirty && frame.pinCount === 0) {
         this.evictFrame(frame);
       }
     }

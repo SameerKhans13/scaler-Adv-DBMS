@@ -27,8 +27,8 @@ export type AST = ASTSelect | ASTInsert | ASTDelete | ASTTxn;
 
 export class Parser {
   static parse(sql: string): AST {
-    const normalized = sql.trim().replace(/\s+/g, ' ');
-    const lower = normalized.toUpperCase();
+    const sanitized = sql.trim().replace(/;+$/, '').replace(/\s+/g, ' ');
+    const lower = sanitized.toUpperCase();
 
     if (lower.startsWith('BEGIN')) {
       return { type: 'BEGIN' };
@@ -41,7 +41,7 @@ export class Parser {
     }
 
     if (lower.startsWith('INSERT INTO')) {
-      const parts = normalized.split(/VALUES/i);
+      const parts = sanitized.split(/VALUES/i);
       const tblPart = parts[0].trim().split(' ');
       const table = tblPart[2].replace(/[\(\)]/g, '').trim();
       const valStr = parts[1].replace(/[\(\)]/g, '').trim();
@@ -55,7 +55,7 @@ export class Parser {
     }
 
     if (lower.startsWith('DELETE FROM')) {
-      const parts = normalized.split(/WHERE/i);
+      const parts = sanitized.split(/WHERE/i);
       const table = parts[0].trim().split(' ')[2];
       let where: any = undefined;
       if (parts[1]) {
@@ -65,7 +65,7 @@ export class Parser {
     }
 
     if (lower.startsWith('SELECT')) {
-      const selectMatch = normalized.match(/SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+JOIN\s+(\w+)\s+ON\s+(.+?))?(?:\s+WHERE\s+(.+))?$/i);
+      const selectMatch = sanitized.match(/SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+JOIN\s+(\w+)\s+ON\s+(.+?))?(?:\s+WHERE\s+(.+))?$/i);
       if (!selectMatch) {
         throw new Error("Syntax Error: Unsupported SELECT syntax");
       }
