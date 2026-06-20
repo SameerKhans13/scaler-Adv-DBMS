@@ -1,4 +1,6 @@
 import { Tuple } from '../types';
+import { BufferPoolManager } from '../storage/BufferPoolManager';
+import { PageManager } from '../storage/PageManager';
 
 export interface Operator {
   init(): void;
@@ -29,13 +31,22 @@ export class SeqScan implements Operator {
 }
 
 export class IndexScan implements Operator {
-  private tuples: Tuple[];
-  private targetKeys: number[];
+  private bufferPool: BufferPoolManager;
+  private pageId: number;
+  private slotId: number;
+  private filterPredicate?: (t: Tuple) => boolean;
   private cursor: number = 0;
 
-  constructor(tuples: Tuple[], targetKeys: number[]) {
-    this.tuples = tuples;
-    this.targetKeys = targetKeys;
+  constructor(
+    bufferPool: BufferPoolManager,
+    pageId: number,
+    slotId: number,
+    filterPredicate?: (t: Tuple) => boolean
+  ) {
+    this.bufferPool = bufferPool;
+    this.pageId = pageId;
+    this.slotId = slotId;
+    this.filterPredicate = filterPredicate;
   }
 
   init() {
@@ -43,10 +54,15 @@ export class IndexScan implements Operator {
   }
 
   next(): Tuple | null {
-    while (this.cursor < this.targetKeys.length) {
-      const key = this.targetKeys[this.cursor++];
-      const match = this.tuples.find(t => t.id === key);
-      if (match) return match;
+    if (this.pageId === -1 || this.slotId === -1) return null;
+    if (this.cursor === 0) {
+      this.cursor++;
+      const page = this.bufferPool.fetchPage(this.pageId);
+      const tuple = PageManager.getTuple(page, this.slotId);
+      this.bufferPool.unpinPage(this.pageId, false);
+      if (tuple && (!this.filterPredicate || this.filterPredicate(tuple))) {
+        return tuple;
+      }
     }
     return null;
   }
