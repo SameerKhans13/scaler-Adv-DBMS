@@ -3,7 +3,7 @@ import { BufferPoolManager } from './storage/BufferPoolManager';
 import { PageManager } from './storage/PageManager';
 import { BPlusTree } from './index/BPlusTree';
 import { Parser } from './query/Parser';
-import { SeqScan, Operator, Filter, NestedLoopJoin } from './query/Operators';
+import { SeqScan, Operator, Filter, NestedLoopJoin, IndexScan } from './query/Operators';
 import { CostBasedOptimizer, PlanNode } from './query/Optimizer';
 import { TransactionManager } from './tx/TransactionManager';
 import { LogManager } from './recovery/LogManager';
@@ -67,6 +67,20 @@ export class DatabaseSystem {
   } {
     let logsBefore = this.logManager.getLogs().length;
     let txn = sessionTxn;
+    const fetchedPages = new Map<number, boolean>(); // pageId -> isDirty
+
+    const bpFetch = (pageId: number) => {
+      const page = this.bufferPool.fetchPage(pageId);
+      if (!fetchedPages.has(pageId)) {
+        fetchedPages.set(pageId, false);
+      }
+      return page;
+    };
+
+    const bpUnpin = (pageId: number, isDirty: boolean) => {
+      this.bufferPool.unpinPage(pageId, isDirty);
+      fetchedPages.delete(pageId);
+    };
 
     try {
       const ast = Parser.parse(sql);
@@ -99,9 +113,16 @@ export class DatabaseSystem {
         const meta = this.tables.get(ast.table);
         if (!meta) throw new Error(`Table ${ast.table} not found`);
 
-        const page = this.bufferPool.fetchPage(meta.pageId);
         const tupleId = ast.values[0];
         if (typeof tupleId !== 'number') throw new Error("Primary Key must be a number");
+
+        // Primary Key Uniqueness Check
+        const index = this.indices.get(`${ast.table}_pk`);
+        if (index && index.search(tupleId) !== null) {
+          throw new Error(`Constraint Violation: Duplicate primary key ${tupleId} already exists in table ${ast.table}`);
+        }
+
+        const page = bpFetch(meta.pageId);
 
         const tuple: Tuple = {
           id: tupleId,
@@ -111,9 +132,9 @@ export class DatabaseSystem {
         };
 
         const slotId = PageManager.insertTuple(page, tuple);
-        this.bufferPool.unpinPage(meta.pageId, true);
+        fetchedPages.set(meta.pageId, true);
+        bpUnpin(meta.pageId, true);
 
-        const index = this.indices.get(`${ast.table}_pk`);
         if (index) {
           index.insert(tupleId, { key: tupleId, pageId: meta.pageId, slotId });
         }
@@ -132,7 +153,7 @@ export class DatabaseSystem {
         const meta = this.tables.get(ast.table);
         if (!meta) throw new Error(`Table ${ast.table} not found`);
 
-        const page = this.bufferPool.fetchPage(meta.pageId);
+        const page = bpFetch(meta.pageId);
         let deletedCount = 0;
 
         for (let s = 0; s < page.slots.length; s++) {
@@ -144,16 +165,29 @@ export class DatabaseSystem {
 
             if (isVisible) {
               if (!ast.where || this.evalCondition(rawT, ast.where, meta.schema)) {
+                // Write-Write Conflict Check
+                if (rawT.xmax !== 0 && rawT.xmax !== activeTxId) {
+                  throw new Error(`Serialization Failure: Concurrent update/delete conflict on key ${rawT.id} (locked by transaction ${rawT.xmax})`);
+                }
+
                 const oldTuple = { ...rawT };
                 rawT.xmax = activeTxId;
                 PageManager.updateTuple(page, s, rawT);
                 deletedCount++;
+                
+                // Keep B+ Tree index in sync
+                const index = this.indices.get(`${ast.table}_pk`);
+                if (index) {
+                  index.delete(rawT.id);
+                }
+
                 this.logManager.appendRecord(activeTxId, 'DELETE', ast.table, meta.pageId, s, oldTuple, rawT);
               }
             }
           }
         }
-        this.bufferPool.unpinPage(meta.pageId, true);
+        fetchedPages.set(meta.pageId, true);
+        bpUnpin(meta.pageId, true);
 
         return {
           results: [`Deleted ${deletedCount} records`],
@@ -166,7 +200,7 @@ export class DatabaseSystem {
         const meta = this.tables.get(ast.table);
         if (!meta) throw new Error(`Table ${ast.table} not found`);
 
-        const page = this.bufferPool.fetchPage(meta.pageId);
+        const page = bpFetch(meta.pageId);
         
         const visibleTuples: Tuple[] = [];
         for (let s = 0; s < page.slots.length; s++) {
@@ -178,12 +212,12 @@ export class DatabaseSystem {
             if (isVisible) visibleTuples.push(t);
           }
         }
-        this.bufferPool.unpinPage(meta.pageId, false);
+        bpUnpin(meta.pageId, false);
 
         let joinTuples: Tuple[] = [];
         let joinMeta = ast.joinTable ? this.tables.get(ast.joinTable) : null;
         if (joinMeta) {
-          const joinPage = this.bufferPool.fetchPage(joinMeta.pageId);
+          const joinPage = bpFetch(joinMeta.pageId);
           for (let s = 0; s < joinPage.slots.length; s++) {
             const t = PageManager.getTuple(joinPage, s);
             if (t) {
@@ -193,19 +227,26 @@ export class DatabaseSystem {
               if (isVisible) joinTuples.push(t);
             }
           }
-          this.bufferPool.unpinPage(joinMeta.pageId, false);
+          bpUnpin(joinMeta.pageId, false);
         }
 
         const hasIndex = this.indices.has(`${ast.table}_pk`);
         const indexKeyPresent = ast.where ? ast.where.column === 'id' : false;
         const plan = CostBasedOptimizer.selectBestPlan(ast, visibleTuples.length, hasIndex, indexKeyPresent);
 
+        // Real Index Scan Execution using direct B+ Tree coordinates
         let scanOp: Operator = new SeqScan(visibleTuples);
         if (plan.type === 'IndexScan' && ast.where) {
           const index = this.indices.get(`${ast.table}_pk`)!;
           const lookup = index.search(ast.where.value);
           if (lookup) {
-            scanOp = new SeqScan(visibleTuples.filter(t => t.id === ast.where!.value));
+            scanOp = new IndexScan(this.bufferPool, lookup.pageId, lookup.slotId, t => {
+              return txn
+                ? TransactionManager.isTupleVisible(t, txn.id, txn.snapshotActiveTxns, this.committedTxns)
+                : t.xmax === 0;
+            });
+          } else {
+            scanOp = new IndexScan(this.bufferPool, -1, -1);
           }
         }
 
@@ -260,6 +301,11 @@ export class DatabaseSystem {
         logsAppended: 0,
         error: err.message
       };
+    } finally {
+      // Centralized automatic clean up of pinned frames on query errors
+      for (const [pageId, isDirty] of fetchedPages) {
+        this.bufferPool.unpinPage(pageId, isDirty);
+      }
     }
     return { results: [], txn, logsAppended: 0 };
   }
@@ -275,17 +321,25 @@ export class DatabaseSystem {
   }
 
   private rollbackTxnActions(txnId: number) {
-    for (const [, meta] of this.tables) {
+    for (const [tableName, meta] of this.tables) {
       const page = this.bufferPool.fetchPage(meta.pageId);
       for (let s = 0; s < page.slots.length; s++) {
         const tuple = PageManager.getTuple(page, s);
         if (tuple) {
           if (tuple.xmin === txnId) {
             PageManager.deleteTuple(page, s);
+            const index = this.indices.get(`${tableName}_pk`);
+            if (index) {
+              index.delete(tuple.id);
+            }
           }
           if (tuple.xmax === txnId) {
             tuple.xmax = 0;
             PageManager.updateTuple(page, s, tuple);
+            const index = this.indices.get(`${tableName}_pk`);
+            if (index) {
+              index.insert(tuple.id, { key: tuple.id, pageId: meta.pageId, slotId: s });
+            }
           }
         }
       }
@@ -302,7 +356,7 @@ export class DatabaseSystem {
 
   recover(): { redoCount: number; undoCount: number; recoverySteps: string[] } {
     const logs = this.logManager.getLogs();
-    const result = RecoveryManager.performARIESRecovery(logs, this.bufferPool, this.committedTxns);
+    const result = RecoveryManager.performARIESRecovery(logs, this.bufferPool, this.committedTxns, this.indices);
     return result;
   }
 }

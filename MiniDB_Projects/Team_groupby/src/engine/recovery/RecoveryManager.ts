@@ -1,12 +1,14 @@
 import { LogRecord } from '../types';
 import { BufferPoolManager } from '../storage/BufferPoolManager';
 import { PageManager } from '../storage/PageManager';
+import { BPlusTree } from '../index/BPlusTree';
 
 export class RecoveryManager {
   static performARIESRecovery(
     logs: LogRecord[],
     bufferPool: BufferPoolManager,
-    committedTxns: Set<number>
+    committedTxns: Set<number>,
+    indices?: Map<string, BPlusTree>
   ): { redoCount: number; undoCount: number; recoverySteps: string[] } {
     const steps: string[] = [];
     let redoCount = 0;
@@ -33,6 +35,14 @@ export class RecoveryManager {
         PageManager.updateTuple(page, log.slotId!, log.newTuple);
         bufferPool.unpinPage(log.pageId, true);
         redoCount++;
+        
+        if (indices && log.tableName) {
+          const index = indices.get(`${log.tableName}_pk`);
+          if (index) {
+            index.insert(log.newTuple.id, { key: log.newTuple.id, pageId: log.pageId, slotId: log.slotId! });
+          }
+        }
+        
         steps.push(`[REDO] LSN ${log.lsn}: Restored INSERT of key ${log.newTuple.id} on page ${log.pageId}`);
       } else if (log.type === 'DELETE' && log.pageId !== undefined) {
         const page = bufferPool.fetchPage(log.pageId);
@@ -43,6 +53,14 @@ export class RecoveryManager {
         }
         bufferPool.unpinPage(log.pageId, true);
         redoCount++;
+
+        if (indices && log.tableName && log.oldTuple) {
+          const index = indices.get(`${log.tableName}_pk`);
+          if (index) {
+            index.delete(log.oldTuple.id);
+          }
+        }
+
         steps.push(`[REDO] LSN ${log.lsn}: Restored DELETE mark on page ${log.pageId}, slot ${log.slotId}`);
       }
     }
@@ -56,12 +74,28 @@ export class RecoveryManager {
           PageManager.deleteTuple(page, log.slotId!);
           bufferPool.unpinPage(log.pageId, true);
           undoCount++;
+
+          if (indices && log.tableName && log.newTuple) {
+            const index = indices.get(`${log.tableName}_pk`);
+            if (index) {
+              index.delete(log.newTuple.id);
+            }
+          }
+
           steps.push(`[UNDO] LSN ${log.lsn}: Reversed INSERT (key: ${log.newTuple?.id}) by uncommitted transaction ${log.txnId}`);
         } else if (log.type === 'DELETE' && log.pageId !== undefined && log.oldTuple) {
           const page = bufferPool.fetchPage(log.pageId);
           PageManager.updateTuple(page, log.slotId!, log.oldTuple);
           bufferPool.unpinPage(log.pageId, true);
           undoCount++;
+
+          if (indices && log.tableName) {
+            const index = indices.get(`${log.tableName}_pk`);
+            if (index) {
+              index.insert(log.oldTuple.id, { key: log.oldTuple.id, pageId: log.pageId, slotId: log.slotId! });
+            }
+          }
+
           steps.push(`[UNDO] LSN ${log.lsn}: Restored deleted record (key: ${log.oldTuple.id}) of uncommitted transaction ${log.txnId}`);
         }
       }
