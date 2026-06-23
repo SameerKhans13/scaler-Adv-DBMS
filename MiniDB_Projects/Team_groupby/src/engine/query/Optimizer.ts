@@ -42,4 +42,24 @@ export class CostBasedOptimizer {
       details: `${scanType === 'IndexScan' ? 'Index Scan using PK B+ Tree' : 'Full Table Scan'} (Cost: ${scanCost.toFixed(2)}, Est Rows: ${estRows})`
     };
   }
+
+  static selectBestJoinOrder(
+    tableASize: number,
+    tableBSize: number,
+    tableASelectivity: number,
+    tableBSelectivity: number
+  ): { outer: 'A' | 'B'; cost: number; isSwapped: boolean } {
+    const estRowsA = Math.ceil(tableASize * tableASelectivity);
+    const estRowsB = Math.ceil(tableBSize * tableBSelectivity);
+
+    // Cost formula: Cost_outer + (EstRows_outer * Cost_inner)
+    // Scan cost is proportional to the relation size (sequential scan)
+    const costAB = tableASize + (estRowsA * tableBSize);
+    const costBA = tableBSize + (estRowsB * tableASize);
+
+    if (costBA < costAB) {
+      return { outer: 'B', cost: costBA, isSwapped: true };
+    }
+    return { outer: 'A', cost: costAB, isSwapped: false };
+  }
 }

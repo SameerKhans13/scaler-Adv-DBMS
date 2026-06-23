@@ -215,12 +215,44 @@ export class DatabaseSystem {
           execOp = new Filter(scanOp, t => this.evalCondition(t, cond, meta.schema));
         }
 
+        let isJoinSwapped = false;
         if (joinMeta && ast.joinOn) {
+          let selectivityA = 1.0;
+          if (ast.where && meta.schema.includes(ast.where.column)) {
+            selectivityA = ast.where.op === '=' ? (1 / Math.max(1, visibleTuples.length)) : 0.3;
+          }
+          let selectivityB = 1.0;
+          if (ast.where && joinMeta.schema.includes(ast.where.column)) {
+            selectivityB = ast.where.op === '=' ? (1 / Math.max(1, joinTuples.length)) : 0.3;
+          }
+
+          const joinOrderResult = CostBasedOptimizer.selectBestJoinOrder(
+            visibleTuples.length,
+            joinTuples.length,
+            selectivityA,
+            selectivityB
+          );
+
+          isJoinSwapped = joinOrderResult.isSwapped;
+          plan.details += ` | Join Order: ${isJoinSwapped ? `${ast.joinTable} ⋈ ${ast.table}` : `${ast.table} ⋈ ${ast.joinTable}`} (Cost: ${joinOrderResult.cost.toFixed(2)})`;
+
           const joinCond = ast.joinOn;
-          const leftIdx = meta.schema.indexOf(joinCond.left.split('.')[1] || joinCond.left);
-          const rightIdx = joinMeta.schema.indexOf(joinCond.right.split('.')[1] || joinCond.right);
-          const innerOp = new SeqScan(joinTuples);
-          execOp = new NestedLoopJoin(execOp, innerOp, (o, i) => o.values[leftIdx] === i.values[rightIdx]);
+          const leftCol = joinCond.left.split('.')[1] || joinCond.left;
+          const rightCol = joinCond.right.split('.')[1] || joinCond.right;
+          const leftIdx = meta.schema.indexOf(leftCol);
+          const rightIdx = joinMeta.schema.indexOf(rightCol);
+
+          if (isJoinSwapped) {
+            const outerOp = new SeqScan(joinTuples);
+            let innerScan: Operator = new SeqScan(visibleTuples);
+            if (ast.where && meta.schema.includes(ast.where.column)) {
+              innerScan = new Filter(innerScan, t => this.evalCondition(t, ast.where!, meta.schema));
+            }
+            execOp = new NestedLoopJoin(outerOp, innerScan, (o, i) => o.values[rightIdx] === i.values[leftIdx]);
+          } else {
+            const innerOp = new SeqScan(joinTuples);
+            execOp = new NestedLoopJoin(execOp, innerOp, (o, i) => o.values[leftIdx] === i.values[rightIdx]);
+          }
         }
 
         execOp.init();
@@ -231,7 +263,9 @@ export class DatabaseSystem {
         }
         execOp.close();
 
-        const finalSchema = joinMeta ? [...meta.schema, ...joinMeta.schema] : meta.schema;
+        const finalSchema = joinMeta 
+          ? (isJoinSwapped ? [...joinMeta.schema, ...meta.schema] : [...meta.schema, ...joinMeta.schema]) 
+          : meta.schema;
         const results = output.map(tuple => {
           const formatted: any = {};
           ast.columns.forEach(col => {
