@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, JSX } from 'react';
 import { DatabaseSystem } from './engine/DatabaseSystem';
 import { Transaction, LogRecord } from './engine/types';
 import { Terminal, Database, ShieldAlert, Cpu, Award, RotateCcw, AlertTriangle, Activity, Zap } from 'lucide-react';
@@ -237,7 +237,7 @@ export default function App() {
               <Cpu size={20} color="#34d399" />
               <h2 style={{ margin: 0, fontSize: '1.2rem' }}>Buffer Pool & Physical Disk Pages</h2>
             </div>
-            
+
             <h3 style={{ fontSize: '0.9rem', color: '#a7f3d0', margin: '0 0 0.5rem 0' }}>Active Buffer Pool Frames (Cache)</h3>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '0.5rem', marginBottom: '1rem' }}>
               {bufferFrames.map((frame, idx) => (
@@ -295,10 +295,10 @@ export default function App() {
             <Activity size={22} color="#6366f1" />
             <h2 style={{ margin: 0, fontSize: '1.2rem' }}>Engine Performance Benchmarks</h2>
           </div>
-          <button 
-            onClick={runBenchmark} 
+          <button
+            onClick={runBenchmark}
             disabled={runningBenchmark}
-            className="glow-btn-primary" 
+            className="glow-btn-primary"
             style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '0.5rem 1.5rem' }}
           >
             {runningBenchmark ? (
@@ -331,7 +331,7 @@ export default function App() {
                 <div style={{ fontSize: '1.8rem', fontWeight: 'bold', color: '#10b981' }}>{benchmarkResults.writesPerSecond.toLocaleString()} <span style={{ fontSize: '0.9rem', fontWeight: 'normal', color: '#64748b' }}>op/s</span></div>
                 <div style={{ fontSize: '0.75rem', color: '#64748b', marginTop: '0.3rem' }}>1,000 INSERT operations</div>
               </div>
-              
+
               {/* Card 2: Reads */}
               <div style={{ background: 'rgba(59,130,246,0.08)', border: '1px solid rgba(59,130,246,0.2)', borderRadius: '10px', padding: '1.2rem', textAlign: 'center' }}>
                 <div style={{ fontSize: '0.85rem', color: '#bfdbfe', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.5rem', fontWeight: 600 }}>Reads Throughput</div>
