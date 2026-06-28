@@ -1,11 +1,53 @@
-import { Page, BufferFrame } from '../types';
+import { Page, BufferFrame, StorageProvider } from '../types';
 import { PageManager } from './PageManager';
+
+export class BrowserStorageProvider implements StorageProvider {
+  getItem(key: string): string | null {
+    if (typeof localStorage !== 'undefined') {
+      return localStorage.getItem(key);
+    }
+    return null;
+  }
+  setItem(key: string, value: string): void {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(key, value);
+    }
+  }
+  removeItem(key: string): void {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(key);
+    }
+  }
+  clear(): void {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.clear();
+    }
+  }
+}
+
+export class InMemoryStorageProvider implements StorageProvider {
+  private store = new Map<string, string>();
+  getItem(key: string): string | null {
+    return this.store.get(key) ?? null;
+  }
+  setItem(key: string, value: string): void {
+    this.store.set(key, value);
+  }
+  removeItem(key: string): void {
+    this.store.delete(key);
+  }
+  clear(): void {
+    this.store.clear();
+  }
+}
 
 export class BufferPoolManager {
   private frames: BufferFrame[] = [];
   private pool: Map<number, Page> = new Map();
   private diskPages: Map<number, Page> = new Map();
-  constructor(size: number = 8) {
+  public storageProvider: StorageProvider;
+
+  constructor(size: number = 8, storageProvider?: StorageProvider) {
     for (let i = 0; i < size; i++) {
       this.frames.push({
         frameId: i,
@@ -15,6 +57,8 @@ export class BufferPoolManager {
         lastAccessed: 0
       });
     }
+    this.storageProvider = storageProvider || (typeof localStorage !== 'undefined' ? new BrowserStorageProvider() : new InMemoryStorageProvider());
+    this.loadFromStorage();
   }
 
   getFrames(): BufferFrame[] {
@@ -46,6 +90,7 @@ export class BufferPoolManager {
     if (!page) {
       page = PageManager.createEmptyPage(pageId);
       this.diskPages.set(pageId, page);
+      this.saveToStorage();
     }
 
     this.pool.set(pageId, page);
@@ -61,7 +106,14 @@ export class BufferPoolManager {
     const frame = this.frames.find(f => f.pageId === pageId);
     if (frame) {
       if (frame.pinCount > 0) frame.pinCount--;
-      if (isDirty) frame.isDirty = true;
+      if (isDirty) {
+        frame.isDirty = true;
+        const page = this.pool.get(pageId);
+        if (page) {
+          this.diskPages.set(pageId, page);
+          this.saveToStorage();
+        }
+      }
     }
   }
 
@@ -71,6 +123,40 @@ export class BufferPoolManager {
         this.evictFrame(frame);
       }
     }
+  }
+
+  public clearStorage() {
+    this.storageProvider.removeItem('minidb_disk_pages');
+    this.diskPages.clear();
+    this.pool.clear();
+    for (const frame of this.frames) {
+      frame.pageId = null;
+      frame.pinCount = 0;
+      frame.isDirty = false;
+      frame.lastAccessed = 0;
+    }
+  }
+
+  private loadFromStorage() {
+    const saved = this.storageProvider.getItem('minidb_disk_pages');
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        for (const [keyStr, val] of Object.entries(parsed)) {
+          this.diskPages.set(Number(keyStr), val as Page);
+        }
+      } catch (e) {
+        console.error("Failed to load disk pages from storage provider", e);
+      }
+    }
+  }
+
+  private saveToStorage() {
+    const obj: Record<number, Page> = {};
+    this.diskPages.forEach((val, key) => {
+      obj[key] = val;
+    });
+    this.storageProvider.setItem('minidb_disk_pages', JSON.stringify(obj));
   }
 
   private findEvictionCandidate(): BufferFrame | undefined {
@@ -90,6 +176,7 @@ export class BufferPoolManager {
     if (frame.isDirty) {
       const page = this.pool.get(frame.pageId)!;
       this.diskPages.set(frame.pageId, page);
+      this.saveToStorage();
     }
     this.pool.delete(frame.pageId);
     frame.pageId = null;

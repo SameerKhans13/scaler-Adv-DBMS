@@ -1,0 +1,1 @@
+[{"lsn":1,"txnId":100,"type":"BEGIN"},{"lsn":2,"txnId":100,"type":"DELETE","tableName":"users","pageId":1,"slotId":0,"oldTuple":{"id":10,"values":[10,"Alice",25],"xmin":0,"xmax":0},"newTuple":{"id":10,"values":[10,"Alice",25],"xmin":0,"xmax":100}},{"lsn":3,"txnId":100,"type":"COMMIT"}]

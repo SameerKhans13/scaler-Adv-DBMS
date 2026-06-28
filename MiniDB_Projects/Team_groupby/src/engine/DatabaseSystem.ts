@@ -1,4 +1,4 @@
-import { Tuple, Transaction } from './types';
+import { Tuple, Transaction, StorageProvider } from './types';
 import { BufferPoolManager } from './storage/BufferPoolManager';
 import { PageManager } from './storage/PageManager';
 import { BPlusTree } from './index/BPlusTree';
@@ -17,8 +17,8 @@ export class DatabaseSystem {
   committedTxns: Set<number> = new Set([0]);
   tables: Map<string, { pageId: number; schema: string[] }> = new Map();
 
-  constructor() {
-    this.bufferPool = new BufferPoolManager(8);
+  constructor(storageProvider?: StorageProvider) {
+    this.bufferPool = new BufferPoolManager(8, storageProvider);
     this.bootstrapData();
   }
 
@@ -29,30 +29,98 @@ export class DatabaseSystem {
     this.indices.set('users_pk', new BPlusTree(3));
     this.indices.set('orders_pk', new BPlusTree(3));
 
-    const userPage = this.bufferPool.fetchPage(1);
-    const usersSeed = [
-      { id: 10, values: [10, 'Alice', 25] },
-      { id: 20, values: [20, 'Bob', 19] },
-      { id: 30, values: [30, 'Charlie', 35] }
-    ];
-    for (const u of usersSeed) {
-      const t: Tuple = { id: u.id, values: u.values, xmin: 0, xmax: 0 };
-      const slotId = PageManager.insertTuple(userPage, t);
-      this.indices.get('users_pk')!.insert(u.id, { key: u.id, pageId: 1, slotId });
-    }
-    this.bufferPool.unpinPage(1, true);
+    const hasSavedData = this.bufferPool.storageProvider.getItem('minidb_disk_pages') !== null;
 
-    const orderPage = this.bufferPool.fetchPage(2);
-    const ordersSeed = [
-      { id: 101, values: [101, 10, 250] },
-      { id: 102, values: [102, 30, 450] }
-    ];
-    for (const o of ordersSeed) {
-      const t: Tuple = { id: o.id, values: o.values, xmin: 0, xmax: 0 };
-      const slotId = PageManager.insertTuple(orderPage, t);
-      this.indices.get('orders_pk')!.insert(o.id, { key: o.id, pageId: 2, slotId });
+    if (hasSavedData) {
+      // Load logs and committed transactions first, so we know which txns actually committed
+      this.loadLogsAndTxns();
+
+      // Rebuild B+ Tree indices dynamically from loaded Slotted Pages
+      for (const [tableName, meta] of this.tables) {
+        const page = this.bufferPool.fetchPage(meta.pageId);
+        const index = this.indices.get(`${tableName}_pk`);
+        if (index) {
+          for (let s = 0; s < page.slots.length; s++) {
+            const t = PageManager.getTuple(page, s);
+            // Rebuild index only for active (visible) and non-deleted/non-uncommitted aborted tuples
+            if (t) {
+              const isDeletedCommitted = t.xmax !== 0 && this.committedTxns.has(t.xmax);
+              if (!isDeletedCommitted) {
+                index.insert(t.id, { key: t.id, pageId: meta.pageId, slotId: s });
+              }
+            }
+          }
+        }
+        this.bufferPool.unpinPage(meta.pageId, false);
+      }
+    } else {
+      // Bootstrap Seed Data
+      const userPage = this.bufferPool.fetchPage(1);
+      const usersSeed = [
+        { id: 10, values: [10, 'Alice', 25] },
+        { id: 20, values: [20, 'Bob', 19] },
+        { id: 30, values: [30, 'Charlie', 35] }
+      ];
+      for (const u of usersSeed) {
+        const t: Tuple = { id: u.id, values: u.values, xmin: 0, xmax: 0 };
+        const slotId = PageManager.insertTuple(userPage, t);
+        this.indices.get('users_pk')!.insert(u.id, { key: u.id, pageId: 1, slotId });
+      }
+      this.bufferPool.unpinPage(1, true);
+
+      const orderPage = this.bufferPool.fetchPage(2);
+      const ordersSeed = [
+        { id: 101, values: [101, 10, 250] },
+        { id: 102, values: [102, 30, 450] }
+      ];
+      for (const o of ordersSeed) {
+        const t: Tuple = { id: o.id, values: o.values, xmin: 0, xmax: 0 };
+        const slotId = PageManager.insertTuple(orderPage, t);
+        this.indices.get('orders_pk')!.insert(o.id, { key: o.id, pageId: 2, slotId });
+      }
+      this.bufferPool.unpinPage(2, true);
+      this.saveLogsAndTxns();
     }
-    this.bufferPool.unpinPage(2, true);
+  }
+
+  loadLogsAndTxns() {
+    const savedTxns = this.bufferPool.storageProvider.getItem('minidb_committed_txns');
+    if (savedTxns) {
+      try {
+        const parsed = JSON.parse(savedTxns);
+        this.committedTxns = new Set(parsed);
+      } catch (e) {
+        console.error("Failed to load committed txns", e);
+      }
+    }
+
+    const savedLogs = this.bufferPool.storageProvider.getItem('minidb_logs');
+    if (savedLogs) {
+      try {
+        const parsed = JSON.parse(savedLogs);
+        this.logManager.clearLogs();
+        for (const rec of parsed) {
+          this.logManager.appendRecord(
+            rec.txnId,
+            rec.type,
+            rec.tableName,
+            rec.pageId,
+            rec.slotId,
+            rec.oldTuple,
+            rec.newTuple
+          );
+        }
+      } catch (e) {
+        console.error("Failed to load logs from storage provider", e);
+      }
+    }
+  }
+
+  saveLogsAndTxns() {
+    const arrTxns = Array.from(this.committedTxns);
+    this.bufferPool.storageProvider.setItem('minidb_committed_txns', JSON.stringify(arrTxns));
+    const logs = this.logManager.getLogs();
+    this.bufferPool.storageProvider.setItem('minidb_logs', JSON.stringify(logs));
   }
 
   executeSQL(
@@ -83,12 +151,52 @@ export class DatabaseSystem {
     };
 
     try {
+      const upperSql = sql.trim().toUpperCase();
+      if (upperSql === 'RESET' || upperSql === 'RESET DATABASE' || upperSql === 'CLEAR') {
+        this.bufferPool.storageProvider.clear();
+        this.committedTxns = new Set([0]);
+        this.logManager.clearLogs();
+        this.bufferPool.clearStorage();
+        this.tables.clear();
+        this.indices.clear();
+        this.bootstrapData();
+        return {
+          results: ['Database reset successfully to original seed data.'],
+          txn: null,
+          logsAppended: 0
+        };
+      }
+
+      if (upperSql === 'CRASH') {
+        this.simulateCrash();
+        return {
+          results: ['System crashed! Buffer pool wiped clean.'],
+          txn: null,
+          logsAppended: 0
+        };
+      }
+
+      if (upperSql === 'RECOVER') {
+        const res = this.recover();
+        return {
+          results: [
+            `Recovery completed successfully!`,
+            `Redone operations: ${res.redoCount}`,
+            `Undone operations: ${res.undoCount}`,
+            ...res.recoverySteps
+          ],
+          txn: null,
+          logsAppended: 0
+        };
+      }
+
       const ast = Parser.parse(sql);
 
       if (ast.type === 'BEGIN') {
         if (txn) throw new Error("Transaction already active in this session");
         txn = this.txManager.beginTransaction();
         this.logManager.appendRecord(txn.id, 'BEGIN');
+        this.saveLogsAndTxns();
         return { results: ['Transaction started'], txn, logsAppended: 1 };
       }
 
@@ -97,6 +205,7 @@ export class DatabaseSystem {
         this.txManager.commitTransaction(txn.id);
         this.committedTxns.add(txn.id);
         this.logManager.appendRecord(txn.id, 'COMMIT');
+        this.saveLogsAndTxns();
         return { results: ['Transaction committed'], txn: null, logsAppended: 1 };
       }
 
@@ -105,11 +214,19 @@ export class DatabaseSystem {
         this.txManager.abortTransaction(txn.id);
         this.logManager.appendRecord(txn.id, 'ABORT');
         this.rollbackTxnActions(txn.id);
+        this.saveLogsAndTxns();
         return { results: ['Transaction rolled back'], txn: null, logsAppended: 1 };
       }
 
       if (ast.type === 'INSERT') {
-        const activeTxId = txn ? txn.id : 0;
+        const implicitTxn = !txn;
+        const activeTxn = txn || this.txManager.beginTransaction();
+        const activeTxId = activeTxn.id;
+
+        if (implicitTxn) {
+          this.logManager.appendRecord(activeTxId, 'BEGIN');
+        }
+
         const meta = this.tables.get(ast.table);
         if (!meta) throw new Error(`Table ${ast.table} not found`);
 
@@ -119,6 +236,9 @@ export class DatabaseSystem {
         // Primary Key Uniqueness Check
         const index = this.indices.get(`${ast.table}_pk`);
         if (index && index.search(tupleId) !== null) {
+          if (implicitTxn) {
+            this.txManager.abortTransaction(activeTxId);
+          }
           throw new Error(`Constraint Violation: Duplicate primary key ${tupleId} already exists in table ${ast.table}`);
         }
 
@@ -141,6 +261,14 @@ export class DatabaseSystem {
 
         this.logManager.appendRecord(activeTxId, 'INSERT', ast.table, meta.pageId, slotId, undefined, tuple);
 
+        if (implicitTxn) {
+          this.txManager.commitTransaction(activeTxId);
+          this.committedTxns.add(activeTxId);
+          this.logManager.appendRecord(activeTxId, 'COMMIT');
+        }
+
+        this.saveLogsAndTxns();
+
         return {
           results: [`Inserted 1 record (ID: ${tupleId})`],
           txn,
@@ -149,7 +277,14 @@ export class DatabaseSystem {
       }
 
       if (ast.type === 'DELETE') {
-        const activeTxId = txn ? txn.id : 0;
+        const implicitTxn = !txn;
+        const activeTxn = txn || this.txManager.beginTransaction();
+        const activeTxId = activeTxn.id;
+
+        if (implicitTxn) {
+          this.logManager.appendRecord(activeTxId, 'BEGIN');
+        }
+
         const meta = this.tables.get(ast.table);
         if (!meta) throw new Error(`Table ${ast.table} not found`);
 
@@ -161,12 +296,15 @@ export class DatabaseSystem {
           if (rawT) {
             const isVisible = txn
               ? TransactionManager.isTupleVisible(rawT, txn.id, txn.snapshotActiveTxns, this.committedTxns)
-              : rawT.xmax === 0;
+              : TransactionManager.isTupleVisible(rawT, Infinity, [], this.committedTxns);
 
             if (isVisible) {
               if (!ast.where || this.evalCondition(rawT, ast.where, meta.schema)) {
                 // Write-Write Conflict Check
                 if (rawT.xmax !== 0 && rawT.xmax !== activeTxId) {
+                  if (implicitTxn) {
+                    this.txManager.abortTransaction(activeTxId);
+                  }
                   throw new Error(`Serialization Failure: Concurrent update/delete conflict on key ${rawT.id} (locked by transaction ${rawT.xmax})`);
                 }
 
@@ -189,6 +327,14 @@ export class DatabaseSystem {
         fetchedPages.set(meta.pageId, true);
         bpUnpin(meta.pageId, true);
 
+        if (implicitTxn) {
+          this.txManager.commitTransaction(activeTxId);
+          this.committedTxns.add(activeTxId);
+          this.logManager.appendRecord(activeTxId, 'COMMIT');
+        }
+
+        this.saveLogsAndTxns();
+
         return {
           results: [`Deleted ${deletedCount} records`],
           txn,
@@ -208,7 +354,7 @@ export class DatabaseSystem {
           if (t) {
             const isVisible = txn
               ? TransactionManager.isTupleVisible(t, txn.id, txn.snapshotActiveTxns, this.committedTxns)
-              : t.xmax === 0;
+              : TransactionManager.isTupleVisible(t, Infinity, [], this.committedTxns);
             if (isVisible) visibleTuples.push(t);
           }
         }
@@ -223,7 +369,7 @@ export class DatabaseSystem {
             if (t) {
               const isVisible = txn
                 ? TransactionManager.isTupleVisible(t, txn.id, txn.snapshotActiveTxns, this.committedTxns)
-                : t.xmax === 0;
+                : TransactionManager.isTupleVisible(t, Infinity, [], this.committedTxns);
               if (isVisible) joinTuples.push(t);
             }
           }
@@ -243,7 +389,7 @@ export class DatabaseSystem {
             scanOp = new IndexScan(this.bufferPool, lookup.pageId, lookup.slotId, t => {
               return txn
                 ? TransactionManager.isTupleVisible(t, txn.id, txn.snapshotActiveTxns, this.committedTxns)
-                : t.xmax === 0;
+                : TransactionManager.isTupleVisible(t, Infinity, [], this.committedTxns);
             });
           } else {
             scanOp = new IndexScan(this.bufferPool, -1, -1);
@@ -273,9 +419,13 @@ export class DatabaseSystem {
         execOp.close();
 
         const finalSchema = joinMeta ? [...meta.schema, ...joinMeta.schema] : meta.schema;
+        const selectColumns = (ast.columns.length === 1 && ast.columns[0] === '*')
+          ? finalSchema
+          : ast.columns;
+
         const results = output.map(tuple => {
           const formatted: any = {};
-          ast.columns.forEach(col => {
+          selectColumns.forEach(col => {
             const rawColName = col.includes('.') ? col.split('.')[1] : col;
             const fullColName = col.includes('.') ? col : col;
             let idx = finalSchema.indexOf(rawColName);
@@ -349,14 +499,36 @@ export class DatabaseSystem {
 
   simulateCrash(): number {
     const logCount = this.logManager.getLogs().length;
-    this.bufferPool = new BufferPoolManager(8);
+    const provider = this.bufferPool.storageProvider;
+    this.bufferPool = new BufferPoolManager(8, provider);
     this.committedTxns = new Set([0]);
+
+    // Rebuild B+ Tree indices dynamically from the post-crash slotted pages
+    for (const [tableName, meta] of this.tables) {
+      this.indices.set(`${tableName}_pk`, new BPlusTree(3));
+      const page = this.bufferPool.fetchPage(meta.pageId);
+      const index = this.indices.get(`${tableName}_pk`);
+      if (index) {
+        for (let s = 0; s < page.slots.length; s++) {
+          const t = PageManager.getTuple(page, s);
+          if (t) {
+            const isDeletedCommitted = t.xmax !== 0 && this.committedTxns.has(t.xmax);
+            if (!isDeletedCommitted) {
+              index.insert(t.id, { key: t.id, pageId: meta.pageId, slotId: s });
+            }
+          }
+        }
+      }
+      this.bufferPool.unpinPage(meta.pageId, false);
+    }
+
     return logCount;
   }
 
   recover(): { redoCount: number; undoCount: number; recoverySteps: string[] } {
     const logs = this.logManager.getLogs();
     const result = RecoveryManager.performARIESRecovery(logs, this.bufferPool, this.committedTxns, this.indices);
+    this.saveLogsAndTxns();
     return result;
   }
 }
